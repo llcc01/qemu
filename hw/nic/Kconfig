@@ -1,0 +1,4 @@
+config NIC_PCI_EXPRESS
+    bool
+    default y if PCI_DEVICES || PCIE_DEVICES
+    depends on PCI_EXPRESS && MSI_NONBROKEN

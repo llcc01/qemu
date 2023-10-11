@@ -68,6 +68,9 @@ source sparc64/Kconfig
 source tricore/Kconfig
 source xtensa/Kconfig
 
+# custom NIC Kconfig
+source nic/Kconfig
+
 # Symbols used by multiple targets
 config TEST_DEVICES
     bool
