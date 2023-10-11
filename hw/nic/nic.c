@@ -13,14 +13,15 @@
 
 #include "qapi/error.h"
 #include "qom/object.h"
-#include <stdint.h>
+
+#include "hw/nic/nic.h"
 
 #define NIC_PCI_VENDOR_ID 0x11cc
 #define NIC_PCI_DEVICE_ID 0x1234
 
 #define NIC_MMIO_SIZE 0x00000010
 
-#define TYPE_NIC_PANGO "nic_pango"
+
 OBJECT_DECLARE_SIMPLE_TYPE(NICPangoState, NIC_PANGO)
 
 struct NICPangoState {

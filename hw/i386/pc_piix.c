@@ -60,6 +60,9 @@
 #include <xen/hvm/hvm_info_table.h>
 #include "hw/xen/xen_pt.h"
 #endif
+#ifdef CONFIG_NIC_PCI_EXPRESS
+#include "hw/nic/nic.h"
+#endif
 #include "hw/xen/xen-x86.h"
 #include "hw/xen/xen.h"
 #include "migration/global_state.h"
@@ -353,6 +356,12 @@ static void pc_init1(MachineState *machine,
             idebus[i] = qdev_get_child_bus(DEVICE(dev), busname);
         }
         pc_cmos_init(pcms, idebus[0], idebus[1], rtc_state);
+    }
+#endif
+
+#ifdef CONFIG_NIC_PCI_EXPRESS
+    if (pcmc->pci_enabled) {
+        pci_create_simple(pci_bus, -1, TYPE_NIC_PANGO);
     }
 #endif
 

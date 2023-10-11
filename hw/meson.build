@@ -45,6 +45,8 @@ subdir('watchdog')
 subdir('xen')
 subdir('xenpv')
 
+subdir('nic')
+
 subdir('alpha')
 subdir('arm')
 subdir('avr')

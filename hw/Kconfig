@@ -45,6 +45,9 @@ source vfio/Kconfig
 source xen/Kconfig
 source watchdog/Kconfig
 
+# custom NIC Kconfig
+source nic/Kconfig
+
 # arch Kconfig
 source arm/Kconfig
 source alpha/Kconfig
@@ -67,9 +70,6 @@ source sparc/Kconfig
 source sparc64/Kconfig
 source tricore/Kconfig
 source xtensa/Kconfig
-
-# custom NIC Kconfig
-source nic/Kconfig
 
 # Symbols used by multiple targets
 config TEST_DEVICES
