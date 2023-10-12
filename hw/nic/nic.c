@@ -19,7 +19,7 @@
 #define NIC_PCI_VENDOR_ID 0x11cc
 #define NIC_PCI_DEVICE_ID 0x1234
 
-#define NIC_MMIO_SIZE 0x00000010
+#define NIC_MMIO_SIZE 0x00000100
 
 
 OBJECT_DECLARE_SIMPLE_TYPE(NICPangoState, NIC_PANGO)
@@ -82,7 +82,7 @@ static void nic_pci_realize(PCIDevice *pci_dev, Error **errp) {
 
   memory_region_init_io(&s->mmio, OBJECT(s), &nic_mmio_ops, s, "nic-mmio",
                         NIC_MMIO_SIZE);
-  pci_register_bar(pci_dev, 1, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
+  pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
 
   if (pcie_endpoint_cap_v1_init(pci_dev, nic_pcie_offset) < 0) {
     hw_error("Failed to initialize PCIe capability");
