@@ -16,6 +16,7 @@
 #include "qom/object.h"
 
 #include "hw/nic/nic.h"
+#include <bits/pthreadtypes.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -82,6 +83,8 @@ struct TDArg {
 
 static uint8_t nic_reg[NIC_MMIO_SIZE] = {0};
 
+pthread_spinlock_t nic_spinlock;
+
 static void *nic_copy_data(void *arg) {
   PCIDevice *dev = ((struct TDArg *)arg)->dev;
   uint16_t dst = ((struct TDArg *)arg)->dst;
@@ -95,6 +98,8 @@ static void *nic_copy_data(void *arg) {
   struct NICRxFrame nic_rx_frame;
 
   free(arg);
+
+  pthread_spin_lock(&nic_spinlock);
   while (nic_reg_src->tx_bd_tail != nic_reg_src->tx_bd_head) {
     qemu_printf("nic_copy_data: tx_bd_tail = %u, tx_bd_head = %u\n",
                 nic_reg_src->tx_bd_tail, nic_reg_src->tx_bd_head);
@@ -118,11 +123,21 @@ static void *nic_copy_data(void *arg) {
     }
 
     // copy data
-    nic_rx_frame.data_len = nic_bd_src.len;
+    // read data from src
     pci_dma_read(dev, nic_bd_src.addr, &nic_rx_frame.data, nic_bd_src.len);
+    nic_bd_src.flags |= NIC_BD_FLAG_USED;
+    pci_dma_write(dev,
+                  nic_reg_src->tx_bd_pa +
+                      sizeof(struct NICBD) * nic_reg_src->tx_bd_tail,
+                  &nic_bd_src, sizeof(struct NICBD));
 
-    pci_dma_write(dev, nic_bd_dst.addr, &nic_rx_frame,
-                  nic_bd_src.len + sizeof(nic_rx_frame.data_len));
+    // write data to dst
+    nic_bd_dst.len = nic_bd_src.len;
+    pci_dma_write(dev, nic_bd_dst.addr, &nic_rx_frame, nic_bd_dst.len);
+    pci_dma_write(dev,
+                  nic_reg_dst->rx_bd_pa +
+                      sizeof(struct NICBD) * nic_reg_dst->rx_bd_head,
+                  &nic_bd_dst, sizeof(struct NICBD));
 
   err_frame:
     nic_reg_src->tx_bd_tail =
@@ -138,13 +153,14 @@ static void *nic_copy_data(void *arg) {
       qemu_printf("nic_copy_data: msi_notify\n");
     }
   }
+  pthread_spin_unlock(&nic_spinlock);
 
   return NULL;
 }
 
 static uint64_t nic_mmio_read(void *opaque, hwaddr addr, unsigned size) {
   //   NICPangoState *s = opaque;
-  qemu_printf("nic_mmio_read %lx(%u bytes)\n", addr, size);
+  uint64_t val = 0;
   if (addr + size > NIC_MMIO_SIZE) {
     qemu_printf("nic_mmio_read: addr + size > NIC_MMIO_SIZE\n");
     return 0;
@@ -152,16 +168,21 @@ static uint64_t nic_mmio_read(void *opaque, hwaddr addr, unsigned size) {
 
   switch (size) {
   case 1:
-    return *(uint8_t *)(nic_reg + addr);
+    val = *(uint8_t *)(nic_reg + addr);
+    break;
   case 2:
-    return *(uint16_t *)(nic_reg + addr);
+    val = *(uint16_t *)(nic_reg + addr);
+    break;
   case 4:
-    return *(uint32_t *)(nic_reg + addr);
+    val = *(uint32_t *)(nic_reg + addr);
+    break;
   case 8:
-    return *(uint64_t *)(nic_reg + addr);
+    val = *(uint64_t *)(nic_reg + addr);
+    break;
   default:
     break;
   }
+  qemu_printf("nic_mmio_read %lx(%u bytes) = %lx\n", addr, size, val);
   return 0;
 }
 
@@ -265,6 +286,8 @@ static void nic_class_init(ObjectClass *klass, void *data) {
 
   dc->desc = "Pango NIC";
   dc->vmsd = &nic_vmstate;
+
+  pthread_spin_init(&nic_spinlock, PTHREAD_PROCESS_PRIVATE);
 }
 
 static const TypeInfo nic_info = {
