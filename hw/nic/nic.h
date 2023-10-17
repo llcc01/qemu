@@ -19,12 +19,19 @@
 #define NIC_MMIO_RX_BD_TAIL_PA 0x30
 #define NIC_MMIO_RX_BD_PA 0x38
 
-#define NIC_MMIO_CSR_INT 0x40
+#define NIC_MMIO_CSR_INT_TX 0x40
+#define NIC_MMIO_CSR_INT_RX 0x41
 
 #define NIC_MMIO_IF_REG_SIZE 0x50
 
 // #define NIC_BD_FLAG_VALID BIT(0)
 #define NIC_BD_FLAG_USED BIT(1)
+
+#define NIC_VEC_TX 0
+#define NIC_VEC_RX 1
+#define NIC_VEC_OTHER 2
+
+#define NIC_VEC_IF_SIZE 4
 
 struct NICBD {
   uint64_t addr;

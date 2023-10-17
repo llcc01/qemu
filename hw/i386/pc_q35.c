@@ -29,6 +29,7 @@
  */
 
 #include "qemu/osdep.h"
+#include CONFIG_DEVICES
 #include "qemu/units.h"
 #include "hw/char/parallel-isa.h"
 #include "hw/loader.h"
@@ -59,7 +60,9 @@
 #include "hw/mem/nvdimm.h"
 #include "hw/i386/acpi-build.h"
 #include "target/i386/cpu.h"
-
+#ifdef CONFIG_NIC_PCI_EXPRESS
+#include "hw/nic/nic.h"
+#endif
 /* ICH9 AHCI has 6 ports */
 #define MAX_SATA_PORTS     6
 
@@ -317,6 +320,12 @@ static void pc_q35_init(MachineState *machine)
     } else {
         idebus[0] = idebus[1] = NULL;
     }
+
+#ifdef CONFIG_NIC_PCI_EXPRESS
+    if (pcmc->pci_enabled) {
+        pci_create_simple(host_bus, -1, TYPE_NIC_PANGO);
+    }
+#endif
 
     if (machine_usb(machine)) {
         /* Should we create 6 UHCI according to ich9 spec? */

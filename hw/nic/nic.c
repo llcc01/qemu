@@ -72,7 +72,9 @@ struct NICReg {
   dma_addr_t rx_bd_tail_pa;
   dma_addr_t rx_bd_pa;
 
-  uint8_t intr;
+  uint8_t intr_tx;
+  uint8_t intr_rx;
+  uint8_t intr_other;
 };
 
 struct TDArg {
@@ -148,9 +150,14 @@ static void *nic_copy_data(void *arg) {
                   sizeof(uint32_t));
 
     // notify
-    if (msi_enabled(dev) && nic_reg_dst->intr) {
-      msi_notify(dev, 0);
+    if (msi_enabled(dev)) {
       qemu_printf("nic_copy_data: msi_notify\n");
+      if (nic_reg_dst->intr_rx) {
+        msi_notify(dev, NIC_VEC_IF_SIZE * dst + NIC_VEC_RX);
+      }
+      if (nic_reg_src->intr_tx) {
+        msi_notify(dev, NIC_VEC_IF_SIZE * src + NIC_VEC_TX);
+      }
     }
   }
   pthread_spin_unlock(&nic_spinlock);
@@ -261,7 +268,7 @@ static void nic_pci_realize(PCIDevice *pci_dev, Error **errp) {
                         NIC_MMIO_SIZE);
   pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
 
-  msi_init(pci_dev, 0, 1, true, true, errp);
+  msi_init(pci_dev, 0, NIC_VEC_IF_SIZE * 2, true, false, errp);
 
   if (pcie_endpoint_cap_init(pci_dev, nic_pcie_offset) < 0) {
     hw_error("Failed to initialize PCIe capability");
