@@ -2,6 +2,8 @@
 #include "qemu/qemu-print.h"
 #include "qemu/units.h"
 
+#include "qemu/bitops.h"
+
 #include "hw/hw.h"
 #include "hw/net/mii.h"
 #include "hw/pci/msi.h"
@@ -10,6 +12,7 @@
 #include "migration/vmstate.h"
 #include "qemu/module.h"
 #include "qemu/range.h"
+#include "sysemu/dma.h"
 #include "sysemu/sysemu.h"
 
 #include "qapi/error.h"
@@ -18,16 +21,32 @@
 #include "hw/nic/nic.h"
 #include <bits/pthreadtypes.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 
-#define NIC_PCI_VENDOR_ID 0x11cc
-#define NIC_PCI_DEVICE_ID 0x1234
-
-#define NIC_MMIO_SIZE 0x00000100
-
 OBJECT_DECLARE_SIMPLE_TYPE(NICPangoState, NIC_PANGO)
+
+struct NICReg {
+  uint32_t tx_bd_ba_low;
+  uint32_t tx_bd_ba_high;
+  uint32_t tx_bd_size;
+  //   uint32_t tx_bd_head;
+  uint32_t tx_bd_tail;
+  uint32_t tx_bd_tail_last;
+
+  uint32_t rx_bd_ba_low;
+  uint32_t rx_bd_ba_high;
+  uint32_t rx_bd_size;
+  //   uint32_t rx_bd_head;
+  uint32_t rx_bd_tail;
+
+  uint32_t intr_tx;
+  uint32_t intr_rx;
+  //   uint8_t intr_other;
+};
 
 struct NICPangoState {
   PCIDevice parent_obj;
@@ -46,6 +65,9 @@ struct NICPangoState {
 
   bool init_vet;
   bool timadj;
+
+  struct NICReg nic_reg[2];
+  sem_t sem;
 };
 
 static const VMStateDescription nic_vmstate = {
@@ -59,64 +81,48 @@ static const VMStateDescription nic_vmstate = {
         },
 };
 
-struct NICReg {
-  uint32_t tx_bd_head;
-  uint32_t tx_bd_tail;
-  dma_addr_t tx_bd_head_pa; // reserved
-  dma_addr_t tx_bd_tail_pa; // reserved
-  dma_addr_t tx_bd_pa;
-
-  uint32_t rx_bd_head; // reserved
-  uint32_t rx_bd_tail; // reserved
-  dma_addr_t rx_bd_head_pa;
-  dma_addr_t rx_bd_tail_pa;
-  dma_addr_t rx_bd_pa;
-
-  uint8_t intr_tx;
-  uint8_t intr_rx;
-  uint8_t intr_other;
-};
-
 struct TDArg {
   PCIDevice *dev;
   uint16_t dst;
   uint16_t src;
 };
 
-static uint8_t nic_reg[NIC_MMIO_SIZE] = {0};
-
-pthread_spinlock_t nic_spinlock;
-
 static void *nic_copy_data(void *arg) {
   PCIDevice *dev = ((struct TDArg *)arg)->dev;
+  NICPangoState *s = NIC_PANGO(dev);
   uint16_t dst = ((struct TDArg *)arg)->dst;
   uint16_t src = ((struct TDArg *)arg)->src;
-  struct NICReg *nic_reg_src =
-      (struct NICReg *)(nic_reg + NIC_MMIO_IF_REG_SIZE * src);
-  struct NICReg *nic_reg_dst =
-      (struct NICReg *)(nic_reg + NIC_MMIO_IF_REG_SIZE * dst);
+  struct NICReg *nic_reg_src = &s->nic_reg[src];
+  struct NICReg *nic_reg_dst = &s->nic_reg[dst];
   struct NICBD nic_bd_src;
   struct NICBD nic_bd_dst;
   struct NICRxFrame nic_rx_frame;
+  dma_addr_t tx_bd_addr;
+  dma_addr_t rx_bd_addr;
+//   size_t i;
 
   free(arg);
 
-  pthread_spin_lock(&nic_spinlock);
-  while (nic_reg_src->tx_bd_tail != nic_reg_src->tx_bd_head) {
-    qemu_printf("nic_copy_data: tx_bd_tail = %u, tx_bd_head = %u\n",
-                nic_reg_src->tx_bd_tail, nic_reg_src->tx_bd_head);
-    if (nic_reg_src->tx_bd_head >= NIC_TX_RING_QUEUES) {
-      qemu_printf("nic_copy_data: tx_bd_head >= NIC_TX_RING_QUEUES\n");
+  if (sem_trywait(&s->sem) != 0) {
+    qemu_printf("nic_copy_data: sem_trywait failed\n");
+    return NULL;
+  }
+  while (nic_reg_src->tx_bd_tail_last != nic_reg_src->tx_bd_tail) {
+    qemu_printf("nic_copy_data: tx_bd_tail_last = %u, tx_bd_tail = %u\n",
+                nic_reg_src->tx_bd_tail_last, nic_reg_src->tx_bd_tail);
+    if (nic_reg_src->tx_bd_tail >= NIC_TX_RING_QUEUES) {
+      qemu_printf("nic_copy_data: tx_bd_tail >= NIC_TX_RING_QUEUES\n");
       goto err_frame;
     }
-    pci_dma_read(dev,
-                 nic_reg_src->tx_bd_pa +
-                     sizeof(struct NICBD) * nic_reg_src->tx_bd_tail,
-                 &nic_bd_src, sizeof(struct NICBD));
-    pci_dma_read(dev,
-                 nic_reg_dst->rx_bd_pa +
-                     sizeof(struct NICBD) * nic_reg_dst->rx_bd_head,
-                 &nic_bd_dst, sizeof(struct NICBD));
+    tx_bd_addr = ((uint64_t)nic_reg_src->tx_bd_ba_high << 32) +
+                 nic_reg_src->tx_bd_ba_low +
+                 sizeof(struct NICBD) * nic_reg_src->tx_bd_tail_last;
+    rx_bd_addr = ((uint64_t)nic_reg_dst->rx_bd_ba_high << 32) +
+                 nic_reg_dst->rx_bd_ba_low +
+                 sizeof(struct NICBD) * nic_reg_dst->rx_bd_tail;
+
+    pci_dma_read(dev, tx_bd_addr, &nic_bd_src, sizeof(struct NICBD));
+    pci_dma_read(dev, rx_bd_addr, &nic_bd_dst, sizeof(struct NICBD));
 
     qemu_printf("nic_copy_data: %u->%u %u\n", src, dst, nic_bd_src.len);
     if (nic_bd_src.len > NIC_RX_PKT_SIZE) {
@@ -128,123 +134,190 @@ static void *nic_copy_data(void *arg) {
     // read data from src
     pci_dma_read(dev, nic_bd_src.addr, &nic_rx_frame.data, nic_bd_src.len);
     nic_bd_src.flags |= NIC_BD_FLAG_USED;
-    pci_dma_write(dev,
-                  nic_reg_src->tx_bd_pa +
-                      sizeof(struct NICBD) * nic_reg_src->tx_bd_tail,
-                  &nic_bd_src, sizeof(struct NICBD));
+    pci_dma_write(dev, tx_bd_addr, &nic_bd_src, sizeof(struct NICBD));
+
+    // print data
+    // for (i = 0; i < nic_bd_src.len; i++) {
+    //   qemu_printf("%02x ", nic_rx_frame.data[i]);
+    // }
+    // qemu_printf("\n");
 
     // write data to dst
     nic_bd_dst.len = nic_bd_src.len;
+    nic_bd_dst.flags |= NIC_BD_FLAG_VALID;
+
     pci_dma_write(dev, nic_bd_dst.addr, &nic_rx_frame, nic_bd_dst.len);
-    pci_dma_write(dev,
-                  nic_reg_dst->rx_bd_pa +
-                      sizeof(struct NICBD) * nic_reg_dst->rx_bd_head,
-                  &nic_bd_dst, sizeof(struct NICBD));
+    pci_dma_write(dev, rx_bd_addr, &nic_bd_dst, sizeof(struct NICBD));
 
   err_frame:
-    nic_reg_src->tx_bd_tail =
-        (nic_reg_src->tx_bd_tail + 1) % NIC_TX_RING_QUEUES;
-    nic_reg_dst->rx_bd_head =
-        (nic_reg_dst->rx_bd_head + 1) % NIC_RX_RING_QUEUES;
-    pci_dma_write(dev, nic_reg_dst->rx_bd_head_pa, &nic_reg_dst->rx_bd_head,
-                  sizeof(uint32_t));
+    nic_reg_src->tx_bd_tail_last =
+        (nic_reg_src->tx_bd_tail_last + 1) % NIC_TX_RING_QUEUES;
+    nic_reg_dst->rx_bd_tail =
+        (nic_reg_dst->rx_bd_tail + 1) % NIC_RX_RING_QUEUES;
 
     // notify
     if (msi_enabled(dev)) {
-      qemu_printf("nic_copy_data: msi_notify\n");
       if (nic_reg_dst->intr_rx) {
         msi_notify(dev, NIC_VEC_IF_SIZE * dst + NIC_VEC_RX);
+        qemu_printf("nic_copy_data: msi_notify %u rx\n", dst);
       }
       if (nic_reg_src->intr_tx) {
         msi_notify(dev, NIC_VEC_IF_SIZE * src + NIC_VEC_TX);
+        qemu_printf("nic_copy_data: msi_notify %u tx\n", src);
       }
     }
   }
-  pthread_spin_unlock(&nic_spinlock);
+  sem_post(&s->sem);
 
   return NULL;
 }
 
 static uint64_t nic_mmio_read(void *opaque, hwaddr addr, unsigned size) {
-  //   NICPangoState *s = opaque;
+  NICPangoState *s = opaque;
   uint64_t val = 0;
-  if (addr + size > NIC_MMIO_SIZE) {
-    qemu_printf("nic_mmio_read: addr + size > NIC_MMIO_SIZE\n");
+  uint64_t temp = addr >> 2;
+  uint8_t func_id;
+  uint8_t if_id;
+  uint8_t reg_id;
+
+  func_id = temp >> 14 & (BIT(4) - 1);
+  if_id = temp >> 7 & (BIT(7) - 1);
+  reg_id = temp & (BIT(7) - 1);
+
+  if (size != 4) {
+    qemu_printf("nic_mmio_read: size != 4\n");
     return 0;
   }
 
-  switch (size) {
-  case 1:
-    val = *(uint8_t *)(nic_reg + addr);
+  if (func_id != NIC_FUNC_ID_DMA) {
+    qemu_printf("nic_mmio_read: func_id!=NIC_FUNC_ID_DMA\n");
+    return 0;
+  }
+
+  if (if_id >= NIC_IF_NUM) {
+    qemu_printf("nic_mmio_read: if_id >= NIC_IF_NUM\n");
+    return 0;
+  }
+
+  switch (reg_id) {
+  case REG_ADDR_TO_ID(NIC_DMA_CTL_TX_BD_BA_LOW):
+    val = s->nic_reg[if_id].tx_bd_ba_low;
     break;
-  case 2:
-    val = *(uint16_t *)(nic_reg + addr);
+  case REG_ADDR_TO_ID(NIC_DMA_CTL_TX_BD_BA_HIGH):
+    val = s->nic_reg[if_id].tx_bd_ba_high;
     break;
-  case 4:
-    val = *(uint32_t *)(nic_reg + addr);
+  case REG_ADDR_TO_ID(NIC_DMA_CTL_TX_BD_SIZE):
+    val = s->nic_reg[if_id].tx_bd_size;
     break;
-  case 8:
-    val = *(uint64_t *)(nic_reg + addr);
+  case REG_ADDR_TO_ID(NIC_DMA_CTL_TX_BD_TAIL):
+    val = s->nic_reg[if_id].tx_bd_tail;
+    break;
+  case REG_ADDR_TO_ID(NIC_DMA_CTL_RX_BD_BA_LOW):
+    val = s->nic_reg[if_id].rx_bd_ba_low;
+    break;
+  case REG_ADDR_TO_ID(NIC_DMA_CTL_RX_BD_BA_HIGH):
+    val = s->nic_reg[if_id].rx_bd_ba_high;
+    break;
+  case REG_ADDR_TO_ID(NIC_DMA_CTL_RX_BD_SIZE):
+    val = s->nic_reg[if_id].rx_bd_size;
+    break;
+  case REG_ADDR_TO_ID(NIC_DMA_CTL_RX_BD_TAIL):
+    val = s->nic_reg[if_id].rx_bd_tail;
+    break;
+  case REG_ADDR_TO_ID(NIC_CSR_CTL_INT_OFFSET(0)):
+    val = s->nic_reg[if_id].intr_tx;
+    break;
+  case REG_ADDR_TO_ID(NIC_CSR_CTL_INT_OFFSET(1)):
+    val = s->nic_reg[if_id].intr_rx;
     break;
   default:
+    qemu_printf("nic_mmio_read: reg_id error\n");
     break;
   }
+
   qemu_printf("nic_mmio_read %lx(%u bytes) = %lx\n", addr, size, val);
-  return 0;
+  return val;
 }
 
 static void nic_mmio_write(void *opaque, hwaddr addr, uint64_t val,
                            unsigned size) {
-  //   NICPangoState *s = opaque;
+  NICPangoState *s = opaque;
   int res;
   pthread_t thread;
   struct TDArg *arg = malloc(sizeof(struct TDArg));
-  if (addr + size > NIC_MMIO_SIZE) {
-    qemu_printf("nic_mmio_write: addr + size > NIC_MMIO_SIZE\n");
+  uint64_t temp = addr >> 2;
+  uint8_t func_id;
+  uint8_t if_id;
+  uint8_t reg_id;
+
+  func_id = temp >> 14 & (BIT(4) - 1);
+  if_id = temp >> 7 & (BIT(7) - 1);
+  reg_id = temp & (BIT(7) - 1);
+
+  if (size != 4) {
+    qemu_printf("nic_mmio_write: size != 4\n");
     return;
   }
 
-  switch (size) {
-  case 1:
-    *(uint8_t *)(nic_reg + addr) = val;
+  if (func_id != NIC_FUNC_ID_DMA) {
+    qemu_printf("nic_mmio_write: func_id!=NIC_FUNC_ID_DMA\n");
+    return;
+  }
+
+  if (if_id >= NIC_IF_NUM) {
+    qemu_printf("nic_mmio_write: if_id >= NIC_IF_NUM\n");
+    return;
+  }
+
+  switch (reg_id) {
+  case REG_ADDR_TO_ID(NIC_DMA_CTL_TX_BD_BA_LOW):
+    s->nic_reg[if_id].tx_bd_ba_low = val;
     break;
-  case 2:
-    *(uint16_t *)(nic_reg + addr) = val;
+  case REG_ADDR_TO_ID(NIC_DMA_CTL_TX_BD_BA_HIGH):
+    s->nic_reg[if_id].tx_bd_ba_high = val;
     break;
-  case 4:
-    *(uint32_t *)(nic_reg + addr) = val;
-    if (addr == NIC_MMIO_TX_BD_HEAD) {
-      qemu_printf("nic_mmio_write: if0 tx_bd_head = %u\n",
-                  ((struct NICReg *)nic_reg)->tx_bd_head);
-      arg->dev = opaque;
-      arg->dst = 1;
-      arg->src = 0;
-      res = pthread_create(&thread, NULL, nic_copy_data, arg);
-      if (res != 0) {
-        qemu_printf("nic_mmio_write: pthread_create failed\n");
-      }
-      return;
-    } else if (addr == NIC_MMIO_IF_REG_SIZE + NIC_MMIO_TX_BD_HEAD) {
-      qemu_printf(
-          "nic_mmio_write: if1 tx_bd_head = %u\n",
-          ((struct NICReg *)(nic_reg + NIC_MMIO_IF_REG_SIZE))->tx_bd_head);
-      arg->dev = opaque;
-      arg->dst = 0;
-      arg->src = 1;
-      res = pthread_create(&thread, NULL, nic_copy_data, arg);
-      if (res != 0) {
-        qemu_printf("nic_mmio_write: pthread_create failed\n");
-      }
-      return;
+  case REG_ADDR_TO_ID(NIC_DMA_CTL_TX_BD_SIZE):
+    s->nic_reg[if_id].tx_bd_size = val;
+    break;
+  case REG_ADDR_TO_ID(NIC_DMA_CTL_TX_BD_TAIL):
+    s->nic_reg[if_id].tx_bd_tail = val;
+    qemu_printf("nic_mmio_write: if%u tx_bd_tail = %lu\n", if_id, val);
+    arg->dev = opaque;
+    arg->dst = if_id ^ 1;
+    arg->src = if_id;
+    res = pthread_create(&thread, NULL, nic_copy_data, arg);
+    if (res != 0) {
+      qemu_printf("nic_mmio_write: pthread_create failed\n");
     }
+    return;
     break;
-  case 8:
-    *(uint64_t *)(nic_reg + addr) = val;
+  case REG_ADDR_TO_ID(NIC_DMA_CTL_RX_BD_BA_LOW):
+    s->nic_reg[if_id].rx_bd_ba_low = val;
+    break;
+  case REG_ADDR_TO_ID(NIC_DMA_CTL_RX_BD_BA_HIGH):
+    s->nic_reg[if_id].rx_bd_ba_high = val;
+    break;
+  case REG_ADDR_TO_ID(NIC_DMA_CTL_RX_BD_SIZE):
+    s->nic_reg[if_id].rx_bd_size = val;
+    break;
+  case REG_ADDR_TO_ID(NIC_DMA_CTL_RX_BD_TAIL):
+    s->nic_reg[if_id].rx_bd_tail = val;
+    break;
+  case REG_ADDR_TO_ID(NIC_CSR_CTL_INT_OFFSET(0)):
+    s->nic_reg[if_id].intr_tx = val;
+    break;
+  case REG_ADDR_TO_ID(NIC_CSR_CTL_INT_OFFSET(1)):
+    s->nic_reg[if_id].intr_rx = val;
     break;
   default:
+    qemu_printf("nic_mmio_write: reg_id error\n");
+    qemu_printf("nic_mmio_write %lx(%u bytes) = %lx\n", addr, size, val);
+    return;
     break;
   }
-  qemu_printf("nic_mmio_write %lx(%u bytes) = %lx\n", addr, size, val);
+
+  qemu_printf("nic_mmio_write: func = %u if = %u reg = %u val = %lx\n", func_id,
+              if_id, reg_id, val);
 }
 
 static const MemoryRegionOps nic_mmio_ops = {
@@ -265,7 +338,7 @@ static void nic_pci_realize(PCIDevice *pci_dev, Error **errp) {
   qemu_printf("nic_pci_realize\n");
 
   memory_region_init_io(&s->mmio, OBJECT(s), &nic_mmio_ops, s, "nic-mmio",
-                        NIC_MMIO_SIZE);
+                        BIT(20));
   pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
 
   msi_init(pci_dev, 0, NIC_VEC_IF_SIZE * 2, true, false, errp);
@@ -273,6 +346,8 @@ static void nic_pci_realize(PCIDevice *pci_dev, Error **errp) {
   if (pcie_endpoint_cap_init(pci_dev, nic_pcie_offset) < 0) {
     hw_error("Failed to initialize PCIe capability");
   }
+
+  sem_init(&s->sem, 0, 1);
 }
 
 static void nic_pci_uninit(PCIDevice *pci_dev) {
@@ -293,8 +368,6 @@ static void nic_class_init(ObjectClass *klass, void *data) {
 
   dc->desc = "Pango NIC";
   dc->vmsd = &nic_vmstate;
-
-  pthread_spin_init(&nic_spinlock, PTHREAD_PROCESS_PRIVATE);
 }
 
 static const TypeInfo nic_info = {
