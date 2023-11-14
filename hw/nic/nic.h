@@ -7,15 +7,19 @@
 
 #include "qemu/bitops.h"
 
-#define NIC_PCI_VENDOR_ID 0x0755
+#define NIC_PCI_VENDOR_ID 0x0813
 
-#define NIC_PCI_DEVICE_ID 0x0755
+#define NIC_PCI_DEVICE_ID 0x0813
 
 #define TYPE_NIC_PANGO "nic_pango"
 
 #define NIC_IF_NUM 2
 
 #define NIC_RX_PKT_SIZE 2048
+
+#define NIC_TX_RING_QUEUES 256
+
+#define NIC_RX_RING_QUEUES 256
 
 
 // mmio
@@ -74,7 +78,7 @@
 
 #define NIC_BD_FLAG_VALID BIT(63)
 
-#define NIC_BD_FLAG_USED BIT(62)
+// #define NIC_BD_FLAG_USED BIT(62)
 
 struct NICBD {
   union {
