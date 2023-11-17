@@ -35,13 +35,14 @@ struct NICReg {
   //   uint32_t tx_bd_size;
   //   uint32_t tx_bd_head;
   uint32_t tx_bd_tail;
-    uint32_t tx_bd_tail_last;
+  uint32_t tx_bd_tail_last;
 
   uint32_t rx_bd_ba_low;
   uint32_t rx_bd_ba_high;
   //   uint32_t rx_bd_size;
   //   uint32_t rx_bd_head;
   uint32_t rx_bd_tail;
+  uint32_t rx_bd_tail_last;
 
   uint32_t intr_tx;
   uint32_t intr_rx;
@@ -110,6 +111,8 @@ static void *nic_copy_data(void *arg) {
   while (nic_reg_src->tx_bd_tail_last != nic_reg_src->tx_bd_tail) {
     qemu_printf("nic_copy_data: tx_bd_tail_last = %u, tx_bd_tail = %u\n",
                 nic_reg_src->tx_bd_tail_last, nic_reg_src->tx_bd_tail);
+    qemu_printf("nic_copy_data: rx_bd_tail_last = %u, rx_bd_tail = %u\n",
+                nic_reg_dst->rx_bd_tail_last, nic_reg_dst->rx_bd_tail);
     if (nic_reg_src->tx_bd_tail >= NIC_TX_RING_QUEUES) {
       qemu_printf("nic_copy_data: tx_bd_tail >= NIC_TX_RING_QUEUES\n");
       goto err_frame;
@@ -119,10 +122,15 @@ static void *nic_copy_data(void *arg) {
                  sizeof(struct NICBD) * nic_reg_src->tx_bd_tail_last;
     rx_bd_addr = ((uint64_t)nic_reg_dst->rx_bd_ba_high << 32) +
                  nic_reg_dst->rx_bd_ba_low +
-                 sizeof(struct NICBD) * nic_reg_dst->rx_bd_tail;
+                 sizeof(struct NICBD) * nic_reg_dst->rx_bd_tail_last;
 
     if (tx_bd_addr == 0 || rx_bd_addr == 0) {
       qemu_printf("nic_copy_data: tx_bd_addr == 0 || rx_bd_addr == 0\n");
+      goto err_frame;
+    }
+
+    if (nic_reg_dst->rx_bd_tail == nic_reg_dst->rx_bd_tail_last) {
+      qemu_printf("nic_copy_data: rx_bd_tail == rx_bd_tail_last\n");
       goto err_frame;
     }
 
@@ -134,8 +142,8 @@ static void *nic_copy_data(void *arg) {
     pci_dma_read(dev, tx_bd_addr, &nic_bd_src, sizeof(struct NICBD));
     pci_dma_read(dev, rx_bd_addr, &nic_bd_dst, sizeof(struct NICBD));
 
-    qemu_printf("src flags = %lx, dst flags = %lx\n", nic_bd_src.flags,
-                nic_bd_dst.flags);
+    // qemu_printf("src flags = %lx, dst flags = %lx\n", nic_bd_src.flags,
+    //             nic_bd_dst.flags);
 
     qemu_printf("nic_copy_data: %u->%u %u\n", src, dst, nic_bd_src.len);
     if (nic_bd_src.len > NIC_RX_PKT_SIZE) {
@@ -167,8 +175,8 @@ static void *nic_copy_data(void *arg) {
   err_frame:
     nic_reg_src->tx_bd_tail_last =
         (nic_reg_src->tx_bd_tail_last + 1) % NIC_TX_RING_QUEUES;
-    nic_reg_dst->rx_bd_tail =
-        (nic_reg_dst->rx_bd_tail + 1) % NIC_RX_RING_QUEUES;
+    nic_reg_dst->rx_bd_tail_last =
+        (nic_reg_dst->rx_bd_tail_last + 1) % NIC_RX_RING_QUEUES;
 
     // notify
     if (msi_enabled(dev)) {
@@ -236,7 +244,7 @@ static uint64_t nic_mmio_read(void *opaque, hwaddr addr, unsigned size) {
     //     val = s->nic_reg[if_id].rx_bd_size;
     //     break;
   case NIC_PCIE_REG_RX_BD_TAIL:
-    val = s->nic_reg[if_id].rx_bd_tail;
+    val = s->nic_reg[if_id].rx_bd_tail_last;
     break;
   case NIC_PCIE_REG_INT_OFFSET(0):
     val = s->nic_reg[if_id].intr_tx;
@@ -315,6 +323,8 @@ static void nic_mmio_write(void *opaque, hwaddr addr, uint64_t val,
     //     break;
   case NIC_PCIE_REG_RX_BD_TAIL:
     s->nic_reg[if_id].rx_bd_tail = val;
+    qemu_printf("nic_mmio_write: if%u rx_bd_tail = %lu\n", if_id, val);
+    return;
     break;
   case NIC_PCIE_REG_INT_OFFSET(0):
     s->nic_reg[if_id].intr_tx = val;
